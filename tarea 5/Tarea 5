@@ -1,0 +1,208 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <time.h>
+#include <unistd.h>
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include <freertos/timers.h>
+#include "esp_log.h"
+#include "hal/gpio_types.h"
+#include "hal/ledc_types.h"
+#include <driver/gpio.h>
+
+//definciones de los pines a utilizar
+#define GPIO_LED 	2
+#define GPIO_BT 	4
+
+//Variable Globales utilizadas
+TimerHandle_t TIMER_DEL_BOTON = NULL; 	//DEFINIENDO UNA ESTRUCTURA TIPO TIMER PARA EL BOTON
+TimerHandle_t TIMER_DEL_LED = NULL;		//DEFINIENDO UNA ESTRUCTURA TIPO TIMER PARA EL LED;
+
+volatile uint32_t TIEMPO_PRECIONADO = 0;  //VARIABLE QUE ALMACENA TIEMPO QUE EL BOTON ESTUVO PRECIONADO
+
+TaskHandle_t TAREA_EVENTOS = NULL; //CREACION DE UNA ESTRUCTIRA TIPO TAREA
+
+esp_err_t ESTADO_INIT_GPIO(void); //PROTOTIPO DE FUNCION QUE INICIALIZA LOS PINES Y CONTADORES
+esp_err_t ESTADO_INIT_TIMERS(void);
+esp_err_t ESTADO_INIT_TAREA(void);
+
+void TIMER_CONTEO_PULSACION_BT(TimerHandle_t pxTimer);
+void TIMER_LED_PARPADEO(TimerHandle_t pxTimer);
+void TASK_EVENTOS_BT(void *pvParameter);
+
+//IRAM Ubica la ISR en RAM para mayor velocidad.
+void IRAM_ATTR INTERRUPCION_BOTON(void *arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;//Bandera para verificar si hay una tarea de mayor prioridad 
+    //lista para ejecutarse.
+    
+    vTaskNotifyGiveFromISR(TAREA_EVENTOS, &xHigherPriorityTaskWoken);//Notifica a la tarea de FreeRTOS desde la ISR.
+    //que es ejecute
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken); //Cambia el contexto para ejecutar la tarea 
+    //inmediatamente si es necesario.
+}
+
+
+
+
+
+void app_main(void)
+{
+	
+  	ESTADO_INIT_GPIO();
+    
+ 	ESTADO_INIT_TIMERS();
+    
+ 	ESTADO_INIT_TAREA();
+ 	
+ 	xTimerStop(TIMER_DEL_BOTON, 0);
+ 	xTimerStop(TIMER_DEL_LED, 0);
+ 	
+}
+
+void TASK_EVENTOS_BT(void *pvParameter)
+{
+	 while (true) {
+        // Esperar la notificación desde la ISR
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // Iniciar el Timer para contar el tiempo del botón presionado
+        TIEMPO_PRECIONADO = 0;
+        xTimerStart(TIMER_DEL_BOTON, 0);
+        gpio_set_level(GPIO_LED, 1);  // Encender LED
+
+        // BUCLE INFINITO HASTA QUE SE SUELTE EL BOTON
+        while (gpio_get_level(GPIO_BT) == 1) {
+            vTaskDelay(pdMS_TO_TICKS(10)); 
+        }
+        
+        
+
+        // DETIENE EL TIMER DEL BOTON
+        xTimerStop(TIMER_DEL_BOTON, 0);
+        //APAGA EL LED
+        gpio_set_level(GPIO_LED, 0);
+
+        // EVALUA SI EL TIEMPO PULSADO ES MAYOR A 0 EN MS
+        if (TIEMPO_PRECIONADO > 0) {
+			
+			//CAMBIA A 200MS POR CADA PALPADEO
+            xTimerChangePeriod(TIMER_DEL_LED, pdMS_TO_TICKS(200), 0);  
+            //INICIAL EL TIMER DEL PARPADEO DEL LED
+            xTimerStart(TIMER_DEL_LED, 0);
+            //ESPERA EL TIEMPO QUE EL BOTON DURA PULSADO PARA SEGUIR
+            vTaskDelay(pdMS_TO_TICKS(TIEMPO_PRECIONADO));
+            //DETIENE EL TIMER DEL PARPADEO DEL LED
+            xTimerStop(TIMER_DEL_LED, 0);
+            //APAGA EL LED
+            gpio_set_level(GPIO_LED, 0);  // Asegurar apagado final
+        }
+    }
+}
+
+esp_err_t ESTADO_INIT_GPIO(){
+	
+	//Se declaro una variable tipo estructura de tipo configuracion de pines 
+	gpio_config_t IO_CONFING;
+	
+	//DECLARACION DEL PIN UTILIZADO COMO SALIDA LED
+	IO_CONFING.pin_bit_mask = (1 << GPIO_LED); //cual es el pin que estaremos utilizando
+	IO_CONFING.mode 	    = GPIO_MODE_OUTPUT; //indicando que el pin sera una salida
+	IO_CONFING.intr_type    = GPIO_INTR_DISABLE;//indicando que no tendra interrupciones
+	IO_CONFING.pull_down_en = GPIO_PULLDOWN_DISABLE; //desactivando la  pull down 
+	IO_CONFING.pull_up_en   = GPIO_PULLUP_DISABLE;	//desactivando la  pull up 
+	gpio_config(&IO_CONFING); //Mandando la direccion de memora de configuracion de la estructura
+	
+	//DECLARACION DEL PIN UTILIZADO COMO SALIDA LED
+	IO_CONFING.pin_bit_mask = (1 << GPIO_BT); //cual es el pin que estaremos utilizando
+	IO_CONFING.mode 	    = GPIO_MODE_INPUT; //indicando que el pin sera una entrada
+	IO_CONFING.intr_type    = GPIO_INTR_POSEDGE;//indicando que tendra interrupciones cuando reciba flanco positivo
+	IO_CONFING.pull_down_en = GPIO_PULLDOWN_ENABLE; //habilitando resistencia pull down
+	IO_CONFING.pull_up_en   = GPIO_PULLUP_DISABLE;	//deshabilitando resistencia pull ip
+	gpio_config(&IO_CONFING);//Mandando la direccion de memora de configuracion de la estructura
+	
+	//Esta función inicializa el servicio de interrupción para los GPIOs.
+	gpio_install_isr_service(0);
+	
+	//Asigna una ISR a un pin exposifico para que se ejecute la funcion cuando sea pulsado
+    gpio_isr_handler_add(GPIO_BT, INTERRUPCION_BOTON, NULL);
+	
+	
+	return ESP_OK;
+	
+}
+
+esp_err_t ESTADO_INIT_TIMERS(){
+	
+	
+	TIMER_DEL_BOTON = xTimerCreate("ITMER BOTON", 
+                            (pdMS_TO_TICKS(10)),
+                            pdTRUE, 
+                            NULL, 
+                            TIMER_CONTEO_PULSACION_BT
+        );
+        
+    TIMER_DEL_LED = xTimerCreate("TIMER LED", 
+                            (pdMS_TO_TICKS(200)),
+                            pdTRUE, 
+                            NULL, 
+                            TIMER_LED_PARPADEO
+                            
+        );
+            if (TIMER_DEL_BOTON == NULL || xTimerStart(TIMER_DEL_BOTON, 0) != pdPASS)
+            {
+                ESP_LOGE("TIMER", "EL TIMER NO FUE CREADO");
+            }else 
+            {
+                    ESP_LOGI("TIMER", "EL TIMER FUE CREADO CON EXITO");
+            }
+		
+			if (TIMER_DEL_LED == NULL || xTimerStart(TIMER_DEL_LED, 0) != pdPASS)
+            {
+                ESP_LOGE("TIMER", "EL TIMER NO FUE CREADO");
+            }else 
+            {
+                    ESP_LOGI("TIMER", "EL TIMER FUE CREADO CON EXITO");
+            }
+            
+	return ESP_OK;	
+}
+
+esp_err_t ESTADO_INIT_TAREA(void){
+
+	ESP_LOGI("TASK", "CONFIGURANDO TASK A UTILIZAR...");
+        //CREACION DE LA PRIMERA TAREA
+        BaseType_t result_task = xTaskCreate(
+            &TASK_EVENTOS_BT,     // Función que ejecutará la tarea
+            "HABILITADOR DE TIMER",      // Nombre descriptivo
+            4096,                           // Tamaño del stack en palabras
+            NULL,                           // Parámetro para la tarea (opcional)
+            1,                              // Prioridad de la tarea (0 = baja, mayor número = más prioridad)
+            &TAREA_EVENTOS                             // Handle de la tarea (opcional)
+        );
+		
+		
+		if (result_task == pdPASS) {
+            ESP_LOGI("TASK", "TAREA CREADA CORRECTAMENTE");
+        } else {
+           
+                ESP_LOGE("TASK", "ERROR AL CREAR LA TAREA: HABILITADOR DE TIMER");
+
+        }
+
+
+	return ESP_OK;
+}
+ 	
+void TIMER_CONTEO_PULSACION_BT(TimerHandle_t pxTimer){
+	
+	TIEMPO_PRECIONADO = TIEMPO_PRECIONADO + 10;
+}
+
+
+void TIMER_LED_PARPADEO(TimerHandle_t pxTimer){
+	
+	static bool ESTAD0_LED = false;
+    gpio_set_level(GPIO_LED, ESTAD0_LED);
+    ESTAD0_LED = !ESTAD0_LED;  // Alternar LED
+	
+}
